@@ -1,0 +1,44 @@
+{
+  "name": "faultsafe",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Resilience for ordinary async functions.",
+  "homepage": "https://github.com/unsady/faultsafe",
+  "bugs": {
+    "url": "https://github.com/unsady/faultsafe/issues"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unsady/faultsafe.git"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint --config oxlint.config.ts",
+    "format": "oxfmt --config oxfmt.config.ts --write .",
+    "format:check": "oxfmt --config oxfmt.config.ts --check .",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm build"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "oxfmt": "^0.72.0",
+    "oxlint": "^1.87.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  },
+  "packageManager": "pnpm@12.10.1"
+}
