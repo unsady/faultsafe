@@ -1,6 +1,12 @@
-import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { protect, QueueFullError, TimeoutError, type RunContext } from './index.js'
+import {
+  CircuitOpenError,
+  protect,
+  QueueFullError,
+  TimeoutError,
+  type RunContext,
+} from './index.js'
 
 function deferred() {
   let resolve!: () => void
@@ -292,6 +298,237 @@ it('waits for timed-out callbacks before retrying or releasing the slot in wait 
   await expect(timedOut).resolves.toBeInstanceOf(TimeoutError)
   await expect(waiting).resolves.toBe('next')
   expect(onError).toHaveBeenCalledTimes(1)
+})
+
+describe('circuit', () => {
+  it('counts final failures after retries and resets the count on success', async () => {
+    const run = protect({ attempts: 2, circuit: { threshold: 2, cooldown: 100 } })
+    const error = new Error('unavailable')
+    const fail = vi.fn<() => Promise<void>>().mockRejectedValue(error)
+    const recover = vi
+      .fn<() => Promise<string>>()
+      .mockRejectedValueOnce(error)
+      .mockResolvedValue('saved')
+    const skipped = vi.fn<() => void>()
+
+    await expect(run(fail)).rejects.toBe(error)
+    await expect(run(recover)).resolves.toBe('saved')
+    await expect(run(fail)).rejects.toBe(error)
+    await expect(run(fail)).rejects.toBe(error)
+    await expect(run(skipped)).rejects.toBeInstanceOf(CircuitOpenError)
+    expect(fail).toHaveBeenCalledTimes(6)
+    expect(skipped).not.toHaveBeenCalled()
+
+    await expect(
+      protect({ circuit: { threshold: 2, cooldown: 100 } })(() => 'saved'),
+    ).resolves.toBe('saved')
+  })
+
+  it('rejects queued calls when opening without cancelling active calls', async () => {
+    const run = protect({
+      concurrency: 2,
+      maxPending: 1,
+      circuit: { threshold: 1, cooldown: 100 },
+    })
+    const active = deferred()
+    const failure = deferred()
+    const error = new Error('unavailable')
+    let received: AbortSignal | undefined
+    const running = run(({ signal }) => {
+      received = signal
+      return active.promise
+    })
+    const failed = run(async () => {
+      await failure.promise
+      throw error
+    }).catch((error: unknown) => error)
+    const skipped = vi.fn<() => void>()
+    const waiting = run(skipped).catch((error: unknown) => error)
+
+    failure.resolve()
+    await expect(failed).resolves.toBe(error)
+    await expect(waiting).resolves.toBeInstanceOf(CircuitOpenError)
+    expect(received?.aborted).toBe(false)
+
+    active.resolve()
+    await running
+    await expect(run(skipped)).rejects.toBeInstanceOf(CircuitOpenError)
+    expect(skipped).not.toHaveBeenCalled()
+  })
+
+  it('admits one probe after cooldown, reopens on failure and closes on success', async () => {
+    const run = protect({ circuit: { threshold: 1, cooldown: 100 } })
+    const error = new Error('unavailable')
+
+    function fail(): never {
+      throw error
+    }
+
+    const skipped = vi.fn<() => void>()
+
+    await expect(run(fail)).rejects.toBe(error)
+    await vi.advanceTimersByTimeAsync(99)
+    await expect(run(skipped)).rejects.toBeInstanceOf(CircuitOpenError)
+    await vi.advanceTimersByTimeAsync(1)
+
+    const blocker = deferred()
+    const probe = run(async () => {
+      await blocker.promise
+      throw error
+    }).catch((error: unknown) => error)
+
+    await expect(run(skipped)).rejects.toBeInstanceOf(CircuitOpenError)
+    blocker.resolve()
+    await expect(probe).resolves.toBe(error)
+
+    await vi.advanceTimersByTimeAsync(99)
+    await expect(run(skipped)).rejects.toBeInstanceOf(CircuitOpenError)
+    await vi.advanceTimersByTimeAsync(1)
+    await expect(run(() => 'recovered')).resolves.toBe('recovered')
+    await expect(run(() => 'saved')).resolves.toBe('saved')
+    expect(skipped).not.toHaveBeenCalled()
+  })
+
+  it('does not count cancellation or queue overflow, or reset failures because of them', async () => {
+    const run = protect({ concurrency: 1, circuit: { threshold: 2, cooldown: 100 } })
+    const error = new Error('unavailable')
+
+    function fail(): never {
+      throw error
+    }
+
+    await expect(run(fail)).rejects.toBe(error)
+
+    const blocker = deferred()
+    const controller = new AbortController()
+    const reason = new Error('cancelled')
+    const cancelled = run(() => blocker.promise, { signal: controller.signal }).catch(
+      (error: unknown) => error,
+    )
+    const skipped = vi.fn<() => void>()
+
+    await expect(run(skipped)).rejects.toBeInstanceOf(QueueFullError)
+    controller.abort(reason)
+    await expect(cancelled).resolves.toBe(reason)
+
+    blocker.resolve()
+    await vi.advanceTimersByTimeAsync(0)
+    await expect(run(fail)).rejects.toBe(error)
+    await expect(run(skipped)).rejects.toBeInstanceOf(CircuitOpenError)
+    expect(skipped).not.toHaveBeenCalled()
+  })
+
+  it('counts only the final timeout and ignores detached callbacks and hook errors', async () => {
+    const hookError = new Error('hook failed')
+    const onError = vi.fn<(error: unknown) => void>(() => {
+      throw hookError
+    })
+    const run = protect({
+      attempts: 2,
+      timeout: 100,
+      circuit: { threshold: 1, cooldown: 100 },
+      onError,
+    })
+    const blocker = deferred()
+    const timedOut = run(() => blocker.promise).catch((error: unknown) => error)
+
+    await vi.advanceTimersByTimeAsync(100)
+    await expect(run(() => 'available')).resolves.toBe('available')
+    await vi.advanceTimersByTimeAsync(100)
+    await expect(timedOut).resolves.toBe(hookError)
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls[0]?.[0]).toBeInstanceOf(TimeoutError)
+
+    blocker.resolve()
+    await vi.advanceTimersByTimeAsync(0)
+    const skipped = vi.fn<() => void>()
+
+    await expect(run(skipped)).rejects.toBe(hookError)
+    expect(onError.mock.calls[1]?.[0]).toBeInstanceOf(CircuitOpenError)
+    expect(skipped).not.toHaveBeenCalled()
+  })
+
+  it('ignores old failures and cancelled probe results across recovery', async () => {
+    const run = protect({ circuit: { threshold: 1, cooldown: 100 } })
+    const error = new Error('unavailable')
+    const old = deferred()
+    const failed = run(async () => {
+      await old.promise
+      throw error
+    }).catch((error: unknown) => error)
+
+    await expect(
+      run(() => {
+        throw error
+      }),
+    ).rejects.toBe(error)
+    await vi.advanceTimersByTimeAsync(100)
+
+    const controller = new AbortController()
+    const reason = new Error('cancelled')
+    const abandoned = deferred()
+    const cancelled = run(() => abandoned.promise, { signal: controller.signal }).catch(
+      (error: unknown) => error,
+    )
+
+    controller.abort(reason)
+    await expect(cancelled).resolves.toBe(reason)
+
+    const replacement = deferred()
+    const probe = run(() => replacement.promise)
+
+    abandoned.resolve()
+    await vi.advanceTimersByTimeAsync(0)
+    const skipped = vi.fn<() => void>()
+
+    await expect(run(skipped)).rejects.toBeInstanceOf(CircuitOpenError)
+    replacement.resolve()
+    await probe
+
+    old.resolve()
+    await expect(failed).resolves.toBe(error)
+    await expect(run(() => 'saved')).resolves.toBe('saved')
+    expect(skipped).not.toHaveBeenCalled()
+  })
+
+  it('reserves the probe only when starting and rejects other queued candidates', async () => {
+    const run = protect({
+      concurrency: 1,
+      maxPending: 2,
+      circuit: { threshold: 1, cooldown: 100 },
+    })
+    const error = new Error('unavailable')
+
+    await expect(
+      run(() => {
+        throw error
+      }),
+    ).rejects.toBe(error)
+    await vi.advanceTimersByTimeAsync(100)
+
+    const controller = new AbortController()
+    const reason = new Error('cancelled')
+    const abandoned = deferred()
+    const cancelled = run(() => abandoned.promise, { signal: controller.signal }).catch(
+      (error: unknown) => error,
+    )
+
+    controller.abort(reason)
+    await expect(cancelled).resolves.toBe(reason)
+
+    const replacement = deferred()
+    const probe = run(() => replacement.promise)
+    const skipped = vi.fn<() => void>()
+    const waiting = run(skipped).catch((error: unknown) => error)
+
+    abandoned.resolve()
+    await expect(waiting).resolves.toBeInstanceOf(CircuitOpenError)
+    expect(skipped).not.toHaveBeenCalled()
+
+    replacement.resolve()
+    await probe
+    await expect(run(() => 'saved')).resolves.toBe('saved')
+  })
 })
 
 it('cancels backoff with the external signal and frees the slot without retrying', async () => {
