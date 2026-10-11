@@ -26,13 +26,10 @@ const run = protect({
     threshold: 5,
     cooldown: 30_000,
   },
-  onError: (error) => {
-    console.error('Operation failed', error)
-  },
 })
 
 const url = 'https://api.example.com/users/1'
-const response = await run(({ signal }) => fetch(url, { signal }))
+const response = await run(() => fetch(url))
 ```
 
 `protect()` creates a runner. Pass a callback to run an operation when a concurrency slot is available. Each call returns a promise with the operation's result or error.
@@ -47,9 +44,36 @@ Without `backoff`, retries start immediately. To add a delay, provide `backoff.t
 
 `backoff.jitter` is an optional fraction from `0` to `1` that randomly reduces the base delay. With a 1,000 millisecond base delay, `jitter: 0.2` produces delays between 800 and 1,000 milliseconds. It defaults to `0`: no jitter. Use `1` for full jitter between zero and the base delay.
 
-Thrown errors and rejected promises trigger retries. `fetch()` resolves for HTTP error responses; throw in your callback to retry them. Only retry operations that are safe to repeat.
+By default, thrown errors and rejected promises trigger retries. `fetch()` resolves for HTTP error responses; throw in your callback to retry them. Only retry operations that are safe to repeat.
 
-`onError(error)` is called once when a call rejects, including cancellation, timeout, queue overflow and circuit rejection. If the hook throws, its error replaces the original rejection.
+## Error policy
+
+Use `errorPolicy` to decide whether an operation error permits another attempt and whether its final failure counts toward the circuit:
+
+```ts
+const run = protect({
+  attempts: 3,
+  errorPolicy: (error) => ({
+    retry: isTransient(error),
+    countForCircuit: isServiceFailure(error),
+  }),
+})
+
+await run(writeOperation, {
+  errorPolicy: (error) => ({
+    retry: false,
+    countForCircuit: isServiceFailure(error),
+  }),
+})
+```
+
+The predicates are application-defined. A synchronous policy runs after each failed attempt, including timeout, before retrying. `retry` permits another attempt within the configured limit; `countForCircuit` applies only to the final error. Without a policy, both are `true`.
+
+A policy in the run options replaces the runner's policy for that call. Errors excluded from the circuit are neutral: they neither increase nor reset its failure count. External cancellation and queue or circuit admission errors bypass the policy.
+
+If the policy throws, the call rejects with `ErrorPolicyError`, an `AggregateError` whose `errors` contains the operation error followed by the policy error, and whose `cause` is the operation error. No retry or fallback runs. This is a neutral circuit outcome and releases a probe reservation.
+
+Handle final call errors with `try`/`catch` or `.catch()`.
 
 ## Timeout
 
@@ -70,13 +94,13 @@ To limit the entire call, including queue wait and backoff, pass an external sig
 
 ## Circuit breaker
 
-`circuit: { threshold: 5, cooldown: 30_000 }` opens the circuit after five consecutive failed calls, counted after all retries. Success resets the count. Both settings are required; `cooldown` is in milliseconds. Without `circuit`, the breaker is disabled.
+`circuit: { threshold: 5, cooldown: 30_000 }` opens the circuit after five consecutive counted failures, evaluated when each call ends. Success resets the count. Both settings are required; `cooldown` is in milliseconds. Without `circuit`, the breaker is disabled.
 
 While open, new and queued calls reject with `CircuitOpenError` without invoking their callbacks. Already active calls are not cancelled, but their later results do not affect the current circuit state.
 
-After cooldown, one probe call is allowed, using the runner's normal retry and timeout settings. Other calls reject until the probe finishes. Success closes the circuit; failure opens it for another full cooldown. Cancelling a probe allows another probe without closing the circuit.
+After cooldown, one probe call is allowed, using the runner's normal retry and timeout settings. Other calls reject until the probe finishes. Success closes the circuit; failure opens it for another full cooldown. A neutral probe outcome, including cancellation or an error excluded by the policy, allows another probe immediately without closing the circuit or starting another cooldown.
 
-External cancellation, `QueueFullError` and `CircuitOpenError` neither count as failures nor reset the count. Final timeouts count as failures. With `timeoutMode: 'wait'`, a callback that never settles can also block the probe indefinitely.
+External cancellation, `QueueFullError` and `CircuitOpenError` neither count as failures nor reset the count. Final timeouts count as failures unless excluded by the error policy. With `timeoutMode: 'wait'`, a callback that never settles can also block the probe indefinitely.
 
 Circuit state is shared by all calls on a runner and independent between runners. Use a separate runner for each protected resource.
 
@@ -85,21 +109,20 @@ Circuit state is shared by all calls on a runner and independent between runners
 Pass `fallback` in the run options to use a backup operation after the primary call fails:
 
 ```ts
-const backup = protect({ attempts: 2, timeout: 5_000 })
 const backupUrl = 'https://backup.example.com/users/1'
 
-const response = await run(({ signal }) => fetch(url, { signal }), {
-  fallback: () => backup(({ signal }) => fetch(backupUrl, { signal })),
+const response = await run(() => fetch(url), {
+  fallback: () => fetch(backupUrl),
 })
 ```
 
-`fallback(error)` runs once after retries are exhausted, or immediately when the circuit or queue rejects the call. It can return a value or promise; the returned value becomes the result of `run`. It is not invoked when the primary succeeds or the external signal is aborted.
+`fallback(error, { signal })` runs once after the operation's final error, including when retries are disabled by the policy, or immediately when the circuit or queue rejects the call. It can return a value or promise; the returned value becomes the result of `run`. It is not invoked when the primary succeeds, the external signal is aborted or the error policy throws. Disabling retry does not disable fallback; its callback must decide whether recovery is safe.
 
 Fallback does not use the primary runner's retries, timeout or concurrency slot. Use a separate runner to protect the backup operation. A successful fallback does not close the primary circuit or reset its failure count.
 
-If fallback throws or rejects, its error becomes the call's rejection. `onError` reports only the final rejection; it is not called when fallback succeeds.
+If fallback throws or rejects, its error becomes the call's rejection.
 
-External cancellation also rejects a call while fallback is running. To stop the backup operation itself, forward the same external signal to its runner.
+Fallback receives the external signal, or a non-aborted signal when none was supplied. This is the call's signal, not an attempt signal aborted by timeout. External cancellation also rejects a call while fallback is running. Forward the fallback context's signal to its operation or backup runner for cooperative cancellation.
 
 ## Cancellation
 

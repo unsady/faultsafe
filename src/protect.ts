@@ -10,7 +10,12 @@ interface PendingOperation {
 }
 
 export function protect(options: ProtectOptions = {}): Runner {
-  const { attempts = 1, timeout, timeoutMode = 'immediate', onError } = options
+  const {
+    attempts = 1,
+    timeout,
+    timeoutMode = 'immediate',
+    errorPolicy: defaultErrorPolicy,
+  } = options
   const backoff =
     options.backoff === undefined
       ? undefined
@@ -47,6 +52,9 @@ export function protect(options: ProtectOptions = {}): Runner {
     runOptions: RunOptions<Fallback> = {},
   ): Promise<Awaited<Result> | Awaited<Fallback>> {
     const { signal, fallback } = runOptions
+    const errorPolicy = runOptions.errorPolicy ?? defaultErrorPolicy
+    let recoverable = true
+
     const result = new Promise<Awaited<Result>>((resolve, reject) => {
       if (signal?.aborted) {
         reject(signal.reason)
@@ -121,26 +129,38 @@ export function protect(options: ProtectOptions = {}): Runner {
           backoff,
           timeout,
           timeoutMode,
+          errorPolicy,
         }).then(
-          (value) => {
-            if (admission !== undefined && !controller.signal.aborted) {
-              circuit?.succeed(admission.generation)
+          (outcome) => {
+            if (outcome.ok) {
+              if (admission !== undefined && !controller.signal.aborted) {
+                circuit?.succeed(admission.generation)
+              }
+
+              resolve(outcome.value)
+            } else {
+              if (admission !== undefined) {
+                if (
+                  controller.signal.aborted ||
+                  !outcome.countForCircuit ||
+                  outcome.error instanceof QueueFullError ||
+                  outcome.error instanceof CircuitOpenError
+                ) {
+                  circuit?.cancel(admission.generation)
+                } else if (circuit?.fail(admission.generation)) {
+                  rejectQueue()
+                }
+              }
+
+              recoverable = outcome.recoverable
+              reject(outcome.error)
             }
 
-            resolve(value)
             finish()
           },
           (error: unknown) => {
             if (admission !== undefined) {
-              if (
-                controller.signal.aborted ||
-                error instanceof QueueFullError ||
-                error instanceof CircuitOpenError
-              ) {
-                circuit?.cancel(admission.generation)
-              } else if (circuit?.fail(admission.generation)) {
-                rejectQueue()
-              }
+              circuit?.cancel(admission.generation)
             }
 
             reject(error)
@@ -161,18 +181,16 @@ export function protect(options: ProtectOptions = {}): Runner {
       }
     })
 
-    const recovered =
-      fallback === undefined
-        ? result
-        : result.catch((error: unknown) => recover(fallback, error, signal))
-
-    if (onError === undefined) {
-      return recovered
+    if (fallback === undefined) {
+      return result
     }
 
-    return recovered.catch((error: unknown) => {
-      onError(error)
-      throw error
+    return result.catch((error: unknown) => {
+      if (!recoverable) {
+        throw error
+      }
+
+      return recover(fallback, error, signal)
     })
   }
 

@@ -1,12 +1,23 @@
-import { TimeoutError } from './errors.js'
-import type { BackoffOptions, RunContext, TimeoutMode } from './types.js'
+import { ErrorPolicyError, TimeoutError } from './errors.js'
+import type {
+  BackoffOptions,
+  ErrorDecision,
+  ErrorPolicy,
+  RunContext,
+  TimeoutMode,
+} from './types.js'
 
 interface ExecutionOptions {
   attempts: number
   backoff: Required<BackoffOptions> | undefined
   timeout: number | undefined
   timeoutMode: TimeoutMode
+  errorPolicy: ErrorPolicy | undefined
 }
+
+type ExecutionResult<Result> =
+  | { ok: true; value: Awaited<Result> }
+  | { ok: false; error: unknown; countForCircuit: boolean; recoverable: boolean }
 
 function wait(duration: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -80,20 +91,44 @@ async function runAttempt<Result>(
 export async function execute<Result>(
   operation: (context: RunContext) => Result,
   signal: AbortSignal,
-  { attempts, backoff, timeout, timeoutMode }: ExecutionOptions,
-): Promise<Awaited<Result>> {
+  { attempts, backoff, timeout, timeoutMode, errorPolicy }: ExecutionOptions,
+): Promise<ExecutionResult<Result>> {
   let attempt = 1
 
   while (true) {
     signal.throwIfAborted()
 
     try {
-      return await runAttempt(operation, signal, timeout, timeoutMode)
+      const value = await runAttempt(operation, signal, timeout, timeoutMode)
+
+      return { ok: true, value }
     } catch (error) {
       signal.throwIfAborted()
 
-      if (attempt >= attempts) {
-        throw error
+      let decision: ErrorDecision
+
+      try {
+        decision = errorPolicy?.(error) ?? { retry: true, countForCircuit: true }
+      } catch (policyError) {
+        signal.throwIfAborted()
+
+        return {
+          ok: false,
+          error: new ErrorPolicyError(error, policyError),
+          countForCircuit: false,
+          recoverable: false,
+        }
+      }
+
+      signal.throwIfAborted()
+
+      if (!decision.retry || attempt >= attempts) {
+        return {
+          ok: false,
+          error,
+          countForCircuit: decision.countForCircuit,
+          recoverable: true,
+        }
       }
 
       if (backoff !== undefined) {
