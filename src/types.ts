@@ -26,13 +26,14 @@ export interface RunContext {
   signal: AbortSignal
 }
 
-export interface RunOptions {
+export interface RunOptions<Result = unknown> {
   signal?: AbortSignal
+  fallback?: (error: unknown) => Result
 }
 
 export interface Runner {
-  <Result>(
+  <Result, Fallback = never>(
     operation: (context: RunContext) => Result,
-    options?: RunOptions,
-  ): Promise<Awaited<Result>>
+    options?: RunOptions<Fallback>,
+  ): Promise<Awaited<Result> | Awaited<Fallback>>
 }

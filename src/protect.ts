@@ -1,5 +1,6 @@
 import { Circuit } from './circuit.js'
 import { CircuitOpenError, QueueFullError } from './errors.js'
+import { recover } from './fallback.js'
 import { execute } from './retry.js'
 import type { ProtectOptions, RunContext, Runner, RunOptions } from './types.js'
 
@@ -41,11 +42,11 @@ export function protect(options: ProtectOptions = {}): Runner {
     }
   }
 
-  function run<Result>(
+  function run<Result, Fallback = never>(
     operation: (context: RunContext) => Result,
-    runOptions: RunOptions = {},
-  ): Promise<Awaited<Result>> {
-    const { signal } = runOptions
+    runOptions: RunOptions<Fallback> = {},
+  ): Promise<Awaited<Result> | Awaited<Fallback>> {
+    const { signal, fallback } = runOptions
     const result = new Promise<Awaited<Result>>((resolve, reject) => {
       if (signal?.aborted) {
         reject(signal.reason)
@@ -160,11 +161,16 @@ export function protect(options: ProtectOptions = {}): Runner {
       }
     })
 
+    const recovered =
+      fallback === undefined
+        ? result
+        : result.catch((error: unknown) => recover(fallback, error, signal))
+
     if (onError === undefined) {
-      return result
+      return recovered
     }
 
-    return result.catch((error: unknown) => {
+    return recovered.catch((error: unknown) => {
       onError(error)
       throw error
     })

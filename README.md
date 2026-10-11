@@ -80,6 +80,27 @@ External cancellation, `QueueFullError` and `CircuitOpenError` neither count as 
 
 Circuit state is shared by all calls on a runner and independent between runners. Use a separate runner for each protected resource.
 
+## Fallback
+
+Pass `fallback` in the run options to use a backup operation after the primary call fails:
+
+```ts
+const backup = protect({ attempts: 2, timeout: 5_000 })
+const backupUrl = 'https://backup.example.com/users/1'
+
+const response = await run(({ signal }) => fetch(url, { signal }), {
+  fallback: () => backup(({ signal }) => fetch(backupUrl, { signal })),
+})
+```
+
+`fallback(error)` runs once after retries are exhausted, or immediately when the circuit or queue rejects the call. It can return a value or promise; the returned value becomes the result of `run`. It is not invoked when the primary succeeds or the external signal is aborted.
+
+Fallback does not use the primary runner's retries, timeout or concurrency slot. Use a separate runner to protect the backup operation. A successful fallback does not close the primary circuit or reset its failure count.
+
+If fallback throws or rejects, its error becomes the call's rejection. `onError` reports only the final rejection; it is not called when fallback succeeds.
+
+External cancellation also rejects a call while fallback is running. To stop the backup operation itself, forward the same external signal to its runner.
+
 ## Cancellation
 
 ```ts
