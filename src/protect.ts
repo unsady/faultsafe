@@ -1,6 +1,6 @@
-import { Circuit } from './circuit.js'
 import { CircuitOpenError, QueueFullError } from './errors.js'
 import { recover } from './fallback.js'
+import { configureProtection } from './protection.js'
 import { execute } from './retry.js'
 import type { ProtectOptions, RunContext, Runner, RunOptions } from './types.js'
 
@@ -10,19 +10,10 @@ interface PendingOperation {
 }
 
 export function protect(options: ProtectOptions = {}): Runner {
-  const {
-    attempts = 1,
-    timeout,
-    timeoutMode = 'immediate',
-    errorPolicy: defaultErrorPolicy,
-  } = options
-  const backoff =
-    options.backoff === undefined
-      ? undefined
-      : { ...options.backoff, jitter: options.backoff.jitter ?? 0 }
+  const { circuit, execution } = configureProtection(options)
+  const defaultErrorPolicy = options.errorPolicy
   const concurrency = options.concurrency ?? Infinity
   const maxPending = options.maxPending ?? 0
-  const circuit = options.circuit === undefined ? undefined : new Circuit({ ...options.circuit })
   const pending = new Set<PendingOperation>()
   let active = 0
 
@@ -125,10 +116,7 @@ export function protect(options: ProtectOptions = {}): Runner {
         }
 
         void execute(operation, controller.signal, {
-          attempts,
-          backoff,
-          timeout,
-          timeoutMode,
+          ...execution,
           errorPolicy,
         }).then(
           (outcome) => {

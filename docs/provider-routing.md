@@ -1,6 +1,6 @@
 # Provider routing
 
-Status: design draft. The API sketches are not implemented contracts.
+`createRouter()` implements priority and sticky selection. Round-robin, adaptive selection, statistics and runtime reconfiguration below remain design proposals.
 
 ## Purpose
 
@@ -37,9 +37,7 @@ const router = createRouter({
   maxPending: 100,
 })
 
-const response = await router.execute((client, { signal }) => client.fetch(url, { signal }), {
-  signal: controller.signal,
-})
+const response = await router.execute((client) => client.fetch(url))
 ```
 
 The router is an object with an `execute` method. Each call supplies an operation, which receives the selected provider's resource and a context containing an `AbortSignal`. Its result type is inferred separately for each call; there is no router-specific request type.
@@ -48,23 +46,22 @@ The router is an object with an `execute` method. Each call supplies an operatio
 
 Different operations share provider circuits, selection state and the queue. Use the same router only when those operations should share a provider health assessment.
 
-Router-level `protection` supplies shared settings, while a provider's `protection` overrides them. Shared settings do not imply shared circuit state. Each provider has its own retry budget; there is no combined attempt budget in this contract.
+Router-level `protection` supplies shared settings, while a provider's `protection` overrides defined fields. Nested `backoff` and `circuit` objects replace inherited objects entirely; `circuit: false` disables an inherited circuit. Shared settings do not imply shared circuit state. Each provider has its own retry budget; there is no combined attempt budget in this contract.
 
 Stable, unique IDs identify providers in circuit state, statistics, priorities and error reports. Array order supplies a default order; it is not the only way to express preference. In the example, explicit priorities prefer A, then C, then B, independently of their array positions.
 
-`selection` groups each policy with its settings. Its type should distinguish policy variants so priority settings cannot be supplied to sticky or round-robin selection:
+`selection` groups each policy with its settings. The implemented type distinguishes priority and sticky variants:
 
 ```ts
 selection: {
-  type: 'ordered'
+  type: 'priority'
 }
 selection: {
   type: 'sticky'
 }
-selection: {
-  type: 'round-robin'
-}
 ```
+
+Priority without explicit priorities implements registration-order traversal. Round-robin remains a proposed policy.
 
 Adaptive selection's settings depend on the observation and scoring rules described below.
 
@@ -116,16 +113,17 @@ An individual call can override the router's default `errorPolicy`:
 
 ```ts
 await router.execute(operation, {
-  signal,
   errorPolicy: decideWriteError,
 })
 ```
 
 The override replaces the policy for that call, including all provider visits; it is not merged with the default policy's decisions. This lets different operations share provider protection state while controlling whether they can safely be repeated. A read may permit retries after a lost connection, while a write with an unknown result may forbid both retry and failover.
 
+Without an error policy, `retry`, `failover` and `countForCircuit` are all `true`.
+
 External cancellation, router admission errors and circuit rejection bypass operation error classification. Circuit rejection skips the candidate; cancellation and admission errors reject directly.
 
-If `errorPolicy` throws, stop the request without retries or failover. Treat the provider health outcome as neutral, release any logical probe reservation and complete the internal execution lifecycle under the normal callback and slot-release rules. Report both the original operation error and the policy error; the exact error shape remains open.
+If `errorPolicy` throws, stop the request without retries or failover. Treat the provider health outcome as neutral, release any logical probe reservation and complete the internal execution lifecycle under the normal callback and slot-release rules. Reject with `ErrorPolicyError`: its `errors` array contains the operation error followed by the policy error, and its `cause` is the operation error.
 
 ## Selection policies
 
@@ -137,7 +135,7 @@ There is no retained current provider. The next request starts from the beginnin
 
 ### Explicit priority
 
-Prefer the highest-priority candidate, with list order as a deterministic tie-breaker. Explicit priorities allow a provider's preference to change without changing its identity or protection state.
+Prefer the highest-priority candidate, with list order as a deterministic tie-breaker. Missing priorities are `0`. Priority keys must identify registered providers and values must be finite. Explicit priorities allow a provider's preference to change without changing its identity or protection state.
 
 After a preferred provider's cooldown, a real request can act as its half-open probe. While that probe is occupied, other requests continue through lower-priority providers. A successful probe restores normal preference; a classified provider failure opens the circuit again.
 
@@ -151,7 +149,7 @@ Retain the provider that succeeds and begin subsequent requests there. Switch wh
 
 For example, A fails and B succeeds. B remains current even when A's cooldown expires. A becomes eligible for another visit, but cooldown alone does not cause a return to A.
 
-Concurrent recovery needs a deterministic rule for which successful switch becomes current. A late result must not overwrite a newer selection blindly.
+The first registered provider is initially current. Each admitted request captures the current selection generation and tries the current provider followed by the remaining providers in registration order. The first successful switch from that generation updates the current provider and increments the generation. Late successes still return to their callers, but cannot overwrite a newer selection.
 
 ### Round-robin
 
@@ -179,7 +177,7 @@ Exploration can use eligible real requests. Background probing would need a sepa
 
 - Visit each provider at most once per logical request. A visit includes that provider's retries and backoff; individual retry attempts are not separate visits.
 - On a visit's final error, select an unvisited candidate only if classification permits failover; otherwise reject with that error. Circuit rejection skips to an unvisited candidate. Return the first successful result. Do not cycle through already-visited providers.
-- Count a visit's final error toward its circuit only when classification marks it as a provider failure. Do not count each failed attempt separately. Intermediate attempt errors remain available in statistics even when the visit's final outcome is neutral.
+- Count a visit's final error toward its circuit only when classification marks it as a provider failure. Do not count each failed attempt separately. Proposed statistics should retain intermediate attempt errors even when the visit's final outcome is neutral.
 - External cancellation, router admission errors and circuit rejection do not count as provider failures. Final attempt timeouts are classified like other operation errors.
 - A final failure need not open a circuit immediately: the configured failure threshold still applies. Selection policy can switch before that threshold is reached.
 - Apply circuit changes before reporting the outcome to selection or user hooks. Ignore results from obsolete circuit generations.
@@ -194,12 +192,12 @@ A half-open probe uses the provider's ordinary retry and timeout settings and th
 
 ## Exhaustion errors
 
-When all candidates have failed or been skipped, reject with a structured routing error containing the ordered visit history. Each entry identifies the provider and distinguishes:
+When all candidates have failed or been skipped, reject with `RoutingError`, an `AggregateError` with an ordered `visits` history. Each entry identifies the provider and distinguishes:
 
 - `failed`: the visit ended with an operation error; preserve that cause.
 - `skipped`: circuit admission rejected the visit; distinguish an open circuit from an occupied half-open probe.
 
-This must distinguish all providers failing, a mix of failures and skipped candidates, and no provider being admitted. The exact error class and field names remain open.
+This must distinguish all providers failing, a mix of failures and skipped candidates, and no provider being admitted. Entries contain `providerId`, `status` and either `cause` for a failed visit or `reason` for a skipped visit. Skip reasons are `'circuit-open'` and `'probe-busy'`. `RoutingError.errors` contains only the causes of failed visits.
 
 External cancellation, queue overflow and an operation error with `failover: false` reject directly rather than being wrapped as candidate exhaustion. A policy exception reports the operation and policy errors separately from exhaustion.
 
@@ -224,7 +222,7 @@ Callbacks detached by an immediate timeout are not awaited again at the end of t
 
 An external deadline can bound the entire request across providers; an attempt timeout applies only to its provider attempt.
 
-## Statistics and observability
+## Statistics and observability (proposed)
 
 Keep observations associated with provider IDs, independently of array order. Distinguish provider health from router-level outcomes: a successful request through B does not turn A's failed visit into a success.
 
@@ -244,12 +242,8 @@ The existing per-call fallback API is independent.
 
 ## Open decisions
 
-- Exact resource and operation context types.
 - Whether custom policies need a public extension contract.
-- Default error policy and the error shape preserving both operation and policy exceptions.
-- Deterministic sticky and round-robin behavior under concurrent requests.
-- Exact routing error shape for ordered failed and skipped visits.
+- Deterministic round-robin behavior under concurrent requests.
 - Provider-specific capacity limits and their interaction with selection.
 - Statistics windows, exploration, confidence and stability rules for adaptive selection.
 - Runtime priority changes, provider replacement and preservation or reset of protection state.
-- Inheritance rules for nested protection settings and explicitly disabling an inherited circuit.
