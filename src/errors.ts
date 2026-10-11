@@ -7,7 +7,7 @@ export class QueueFullError extends Error {
 
 export class TimeoutError extends Error {
   constructor(readonly timeout: number) {
-    super(`The operation exceeded its ${timeout} millisecond timeout`)
+    super(`The attempt exceeded its ${timeout} millisecond timeout`)
     this.name = 'TimeoutError'
   }
 }

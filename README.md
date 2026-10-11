@@ -19,6 +19,7 @@ const run = protect({
     jitter: 0.2,
   },
   timeout: 5_000,
+  timeoutMode: 'immediate',
   concurrency: 8,
   maxPending: 100,
   onError: (error) => {
@@ -48,13 +49,20 @@ Thrown errors and rejected promises trigger retries. `fetch()` resolves for HTTP
 
 ## Timeout
 
-`timeout` is in milliseconds and covers all attempts and retry delays, excluding time in the queue. When it expires, the callback's signal is aborted and the call rejects with `TimeoutError`. There is no timeout by default.
+`timeout` limits each attempt in milliseconds, excluding queue wait and backoff. When it expires, the attempt's signal is aborted with `TimeoutError`. There is no timeout by default.
+
+`timeoutMode` controls when a timed-out attempt ends:
+
+- `'immediate'` (default): without waiting for the callback. The next attempt starts after backoff, or the call rejects and releases its slot if no attempts remain. A callback that ignores its signal can keep running and overlap with later attempts or calls.
+- `'wait'`: after the callback settles. Retries do not overlap, but a callback that never settles can block the call indefinitely.
+
+To limit the entire call, including queue wait and backoff, pass an external signal such as `AbortSignal.timeout(15_000)` in the run options.
 
 ## Concurrency and queue
 
-`concurrency` limits active calls per runner, including calls waiting between retry attempts. `maxPending` limits queued calls, excluding active ones. Both default to `Infinity`.
+`concurrency` defaults to `Infinity`: no limit. A slot stays occupied for the entire operation, including retries and backoff. The limit counts active calls, not callbacks left running after an immediate timeout.
 
-When the queue is full, new calls reject with `QueueFullError` without invoking their callbacks.
+`maxPending` defaults to `0`: no queue. When all concurrency slots are occupied, new calls reject with `QueueFullError` without invoking their callbacks. Set `maxPending > 0` to enable a queue; the limit counts only waiting calls, excluding active ones.
 
 ## Cancellation
 
@@ -78,7 +86,7 @@ The callback always receives an `AbortSignal` that is aborted by external cancel
 
 Aborting a queued call removes it from the queue and frees its pending slot. An already aborted signal rejects without invoking the callback. External cancellation rejects with the supplied signal's reason and prevents further attempts.
 
-Cancellation and timeout reject the returned promise. The operation itself must handle the signal to stop running; its concurrency slot stays occupied until it settles.
+External cancellation rejects the returned promise. The operation itself must handle the signal to stop running. If the current attempt ignores external cancellation, its slot stays occupied until it settles.
 
 ## License
 

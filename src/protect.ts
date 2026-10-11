@@ -1,4 +1,4 @@
-import { QueueFullError, TimeoutError } from './errors.js'
+import { QueueFullError } from './errors.js'
 import { execute } from './retry.js'
 import type { ProtectOptions, RunContext, Runner, RunOptions } from './types.js'
 
@@ -7,13 +7,13 @@ interface PendingOperation {
 }
 
 export function protect(options: ProtectOptions = {}): Runner {
-  const { attempts = 1, timeout, onError } = options
+  const { attempts = 1, timeout, timeoutMode = 'immediate', onError } = options
   const backoff =
     options.backoff === undefined
       ? undefined
       : { ...options.backoff, jitter: options.backoff.jitter ?? 0 }
   const concurrency = options.concurrency ?? Infinity
-  const maxPending = options.maxPending ?? Infinity
+  const maxPending = options.maxPending ?? 0
   const pending = new Set<PendingOperation>()
   let active = 0
 
@@ -52,19 +52,16 @@ export function protect(options: ProtectOptions = {}): Runner {
         active += 1
 
         const controller = new AbortController()
-        let timer: ReturnType<typeof setTimeout> | undefined
 
         function forwardAbort(): void {
           controller.abort(signal?.reason)
         }
 
         function onAbort(): void {
-          clearTimeout(timer)
           reject(controller.signal.reason)
         }
 
         function finish(): void {
-          clearTimeout(timer)
           signal?.removeEventListener('abort', forwardAbort)
           controller.signal.removeEventListener('abort', onAbort)
           active -= 1
@@ -76,13 +73,14 @@ export function protect(options: ProtectOptions = {}): Runner {
 
         if (signal?.aborted) {
           forwardAbort()
-        } else if (timeout === 0) {
-          controller.abort(new TimeoutError(timeout))
-        } else if (timeout !== undefined) {
-          timer = setTimeout(() => controller.abort(new TimeoutError(timeout)), timeout)
         }
 
-        void execute(operation, { signal: controller.signal }, attempts, backoff).then(
+        void execute(operation, controller.signal, {
+          attempts,
+          backoff,
+          timeout,
+          timeoutMode,
+        }).then(
           (value) => {
             resolve(value)
             finish()

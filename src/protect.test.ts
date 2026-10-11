@@ -98,6 +98,20 @@ it.each<{ type: 'fixed' | 'exponential'; secondDelay: number }>([
   await expect(result).resolves.toBe('saved')
 })
 
+it('rejects excess calls without queuing by default', async () => {
+  const run = protect({ concurrency: 1 })
+  const blocker = deferred()
+  const running = run(() => blocker.promise)
+  const overflow = vi.fn<() => string>(() => 'saved')
+
+  await expect(run(overflow)).rejects.toBeInstanceOf(QueueFullError)
+  expect(overflow).not.toHaveBeenCalled()
+
+  blocker.resolve()
+  await running
+  await expect(run(overflow)).resolves.toBe('saved')
+})
+
 it('shares concurrency and pending limits across operations and releases a slot after failure', async () => {
   const run = protect({ concurrency: 2, maxPending: 1 })
   const first = deferred()
@@ -148,7 +162,7 @@ it('skips already aborted operations and frees a pending slot on cancellation', 
 })
 
 it('forwards cancellation without releasing the slot until the operation settles or retrying it', async () => {
-  const run = protect({ concurrency: 1, attempts: 3 })
+  const run = protect({ concurrency: 1, maxPending: 1, attempts: 3 })
   const controller = new AbortController()
   const blocker = deferred()
   const reason = new Error('cancelled')
@@ -172,30 +186,132 @@ it('forwards cancellation without releasing the slot until the operation settles
   expect(operation).toHaveBeenCalledTimes(1)
 })
 
-it('excludes queue wait from timeout but includes all attempts and backoff', async () => {
+it('gives each attempt its own timeout, excluding backoff and queue wait', async () => {
   const run = protect({
     concurrency: 1,
+    maxPending: 1,
     timeout: 100,
-    attempts: 3,
-    backoff: { type: 'exponential', delay: 60, jitter: 0 },
+    attempts: 2,
+    backoff: { type: 'fixed', delay: 200 },
   })
   const blocker = deferred()
-  const timedOut = run(() => blocker.promise).catch((error: unknown) => error)
-  let received: AbortSignal | undefined
-  const operation = vi.fn<(context: RunContext) => never>(({ signal }) => {
-    received = signal
-    throw new Error('unavailable')
+  const signals: AbortSignal[] = []
+  const operation = vi.fn<(context: RunContext) => Promise<string>>(async ({ signal }) => {
+    signals.push(signal)
+
+    if (signals.length === 1) {
+      await blocker.promise
+      return 'late'
+    }
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 80))
+    return 'saved'
   })
-  const waiting = run(operation).catch((error: unknown) => error)
+  const result = run(operation).catch((error: unknown) => error)
+  const next = vi.fn<() => string>(() => 'next')
+  const waiting = run(next)
 
   await vi.advanceTimersByTimeAsync(200)
-  await expect(timedOut).resolves.toBeInstanceOf(TimeoutError)
-  expect(operation).not.toHaveBeenCalled()
+  expect(signals[0]?.reason).toBeInstanceOf(TimeoutError)
+  expect(operation).toHaveBeenCalledTimes(1)
+
+  await vi.advanceTimersByTimeAsync(99)
+  expect(operation).toHaveBeenCalledTimes(1)
+  expect(next).not.toHaveBeenCalled()
+
+  await vi.advanceTimersByTimeAsync(1)
+  expect(operation).toHaveBeenCalledTimes(2)
+  expect(signals[1]?.aborted).toBe(false)
+
+  await vi.advanceTimersByTimeAsync(80)
+  await expect(result).resolves.toBe('saved')
+  await expect(waiting).resolves.toBe('next')
 
   blocker.resolve()
-  await vi.advanceTimersByTimeAsync(100)
-  await expect(waiting).resolves.toBeInstanceOf(TimeoutError)
+  await vi.advanceTimersByTimeAsync(0)
+})
 
+it('releases the slot on the final timeout and ignores a late callback rejection', async () => {
+  const onError = vi.fn<(error: unknown) => void>()
+  const run = protect({
+    concurrency: 1,
+    maxPending: 1,
+    timeout: 100,
+    timeoutMode: 'immediate',
+    onError,
+  })
+  const blocker = deferred()
+  const timedOut = run(async () => {
+    await blocker.promise
+    throw new Error('late')
+  }).catch((error: unknown) => error)
+  const waiting = run(() => 'next')
+
+  await vi.advanceTimersByTimeAsync(100)
+  await expect(timedOut).resolves.toBeInstanceOf(TimeoutError)
+  await expect(waiting).resolves.toBe('next')
+
+  blocker.resolve()
+  await vi.advanceTimersByTimeAsync(0)
+  expect(onError).toHaveBeenCalledTimes(1)
+})
+
+it('waits for timed-out callbacks before retrying or releasing the slot in wait mode', async () => {
+  const onError = vi.fn<(error: unknown) => void>()
+  const run = protect({
+    concurrency: 1,
+    maxPending: 1,
+    attempts: 2,
+    timeout: 100,
+    timeoutMode: 'wait',
+    onError,
+  })
+  const first = deferred()
+  const second = deferred()
+  const signals: AbortSignal[] = []
+  const operation = vi.fn<(context: RunContext) => Promise<void>>(({ signal }) => {
+    signals.push(signal)
+    return signals.length === 1 ? first.promise : second.promise
+  })
+  const timedOut = run(operation).catch((error: unknown) => error)
+  const next = vi.fn<() => string>(() => 'next')
+  const waiting = run(next)
+
+  await vi.advanceTimersByTimeAsync(200)
+  expect(signals[0]?.reason).toBeInstanceOf(TimeoutError)
+  expect(operation).toHaveBeenCalledTimes(1)
+
+  first.resolve()
+  await vi.advanceTimersByTimeAsync(100)
+  expect(signals[1]?.reason).toBeInstanceOf(TimeoutError)
   expect(operation).toHaveBeenCalledTimes(2)
-  expect(received?.aborted).toBe(true)
+  expect(onError).not.toHaveBeenCalled()
+  expect(next).not.toHaveBeenCalled()
+
+  second.resolve()
+  await expect(timedOut).resolves.toBeInstanceOf(TimeoutError)
+  await expect(waiting).resolves.toBe('next')
+  expect(onError).toHaveBeenCalledTimes(1)
+})
+
+it('cancels backoff with the external signal and frees the slot without retrying', async () => {
+  const run = protect({
+    concurrency: 1,
+    maxPending: 1,
+    attempts: 3,
+    backoff: { type: 'fixed', delay: 1_000 },
+  })
+  const controller = new AbortController()
+  const reason = new Error('cancelled')
+  const operation = vi.fn<() => Promise<void>>().mockRejectedValue(new Error('unavailable'))
+  const cancelled = run(operation, { signal: controller.signal }).catch((error: unknown) => error)
+  const waiting = run(() => 'next')
+
+  await vi.advanceTimersByTimeAsync(0)
+  controller.abort(reason)
+
+  await expect(cancelled).resolves.toBe(reason)
+  await expect(waiting).resolves.toBe('next')
+  await vi.runAllTimersAsync()
+  expect(operation).toHaveBeenCalledTimes(1)
 })

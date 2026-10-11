@@ -4,10 +4,13 @@ export interface BackoffOptions {
   jitter?: number
 }
 
+export type TimeoutMode = 'immediate' | 'wait'
+
 export interface ProtectOptions {
   attempts?: number
   backoff?: BackoffOptions
   timeout?: number
+  timeoutMode?: TimeoutMode
   concurrency?: number
   maxPending?: number
   onError?: (error: unknown) => void
