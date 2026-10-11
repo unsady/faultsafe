@@ -1,7 +1,8 @@
-export { QueueFullError, TimeoutError } from './errors.js'
+export { CircuitOpenError, QueueFullError, TimeoutError } from './errors.js'
 export { protect } from './protect.js'
 export type {
   BackoffOptions,
+  CircuitOptions,
   ProtectOptions,
   RunContext,
   Runner,

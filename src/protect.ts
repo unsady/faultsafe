@@ -1,9 +1,12 @@
-import { QueueFullError } from './errors.js'
+import { Circuit } from './circuit.js'
+import { CircuitOpenError, QueueFullError } from './errors.js'
+import { recover } from './fallback.js'
 import { execute } from './retry.js'
 import type { ProtectOptions, RunContext, Runner, RunOptions } from './types.js'
 
 interface PendingOperation {
   start: () => void
+  reject: (error: unknown) => void
 }
 
 export function protect(options: ProtectOptions = {}): Runner {
@@ -14,8 +17,17 @@ export function protect(options: ProtectOptions = {}): Runner {
       : { ...options.backoff, jitter: options.backoff.jitter ?? 0 }
   const concurrency = options.concurrency ?? Infinity
   const maxPending = options.maxPending ?? 0
+  const circuit = options.circuit === undefined ? undefined : new Circuit({ ...options.circuit })
   const pending = new Set<PendingOperation>()
   let active = 0
+
+  function rejectQueue(): void {
+    const error = new CircuitOpenError()
+
+    for (const entry of pending) {
+      entry.reject(error)
+    }
+  }
 
   function drain(): void {
     while (active < concurrency) {
@@ -30,26 +42,51 @@ export function protect(options: ProtectOptions = {}): Runner {
     }
   }
 
-  function run<Result>(
+  function run<Result, Fallback = never>(
     operation: (context: RunContext) => Result,
-    runOptions: RunOptions = {},
-  ): Promise<Awaited<Result>> {
-    const { signal } = runOptions
+    runOptions: RunOptions<Fallback> = {},
+  ): Promise<Awaited<Result> | Awaited<Fallback>> {
+    const { signal, fallback } = runOptions
     const result = new Promise<Awaited<Result>>((resolve, reject) => {
       if (signal?.aborted) {
         reject(signal.reason)
         return
       }
 
-      function cancelPending(): void {
+      try {
+        circuit?.check()
+      } catch (error) {
+        reject(error)
+        return
+      }
+
+      function rejectPending(error: unknown): void {
         pending.delete(entry)
         signal?.removeEventListener('abort', cancelPending)
-        reject(signal?.reason)
+        reject(error)
+      }
+
+      function cancelPending(): void {
+        rejectPending(signal?.reason)
       }
 
       function start(): void {
         signal?.removeEventListener('abort', cancelPending)
+
+        let admission: { generation: number; probe: boolean } | undefined
+
+        try {
+          admission = circuit?.enter()
+        } catch (error) {
+          rejectPending(error)
+          return
+        }
+
         active += 1
+
+        if (admission?.probe) {
+          rejectQueue()
+        }
 
         const controller = new AbortController()
 
@@ -58,6 +95,10 @@ export function protect(options: ProtectOptions = {}): Runner {
         }
 
         function onAbort(): void {
+          if (admission !== undefined) {
+            circuit?.cancel(admission.generation)
+          }
+
           reject(controller.signal.reason)
         }
 
@@ -82,17 +123,33 @@ export function protect(options: ProtectOptions = {}): Runner {
           timeoutMode,
         }).then(
           (value) => {
+            if (admission !== undefined && !controller.signal.aborted) {
+              circuit?.succeed(admission.generation)
+            }
+
             resolve(value)
             finish()
           },
           (error: unknown) => {
+            if (admission !== undefined) {
+              if (
+                controller.signal.aborted ||
+                error instanceof QueueFullError ||
+                error instanceof CircuitOpenError
+              ) {
+                circuit?.cancel(admission.generation)
+              } else if (circuit?.fail(admission.generation)) {
+                rejectQueue()
+              }
+            }
+
             reject(error)
             finish()
           },
         )
       }
 
-      const entry: PendingOperation = { start }
+      const entry: PendingOperation = { start, reject: rejectPending }
 
       if (active < concurrency && pending.size === 0) {
         start()
@@ -104,11 +161,16 @@ export function protect(options: ProtectOptions = {}): Runner {
       }
     })
 
+    const recovered =
+      fallback === undefined
+        ? result
+        : result.catch((error: unknown) => recover(fallback, error, signal))
+
     if (onError === undefined) {
-      return result
+      return recovered
     }
 
-    return result.catch((error: unknown) => {
+    return recovered.catch((error: unknown) => {
       onError(error)
       throw error
     })

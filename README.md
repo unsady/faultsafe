@@ -22,6 +22,10 @@ const run = protect({
   timeoutMode: 'immediate',
   concurrency: 8,
   maxPending: 100,
+  circuit: {
+    threshold: 5,
+    cooldown: 30_000,
+  },
   onError: (error) => {
     console.error('Operation failed', error)
   },
@@ -45,7 +49,7 @@ Without `backoff`, retries start immediately. To add a delay, provide `backoff.t
 
 Thrown errors and rejected promises trigger retries. `fetch()` resolves for HTTP error responses; throw in your callback to retry them. Only retry operations that are safe to repeat.
 
-`onError(error)` is called once when a call rejects, including cancellation, timeout and queue overflow. If the hook throws, its error replaces the original rejection.
+`onError(error)` is called once when a call rejects, including cancellation, timeout, queue overflow and circuit rejection. If the hook throws, its error replaces the original rejection.
 
 ## Timeout
 
@@ -63,6 +67,39 @@ To limit the entire call, including queue wait and backoff, pass an external sig
 `concurrency` defaults to `Infinity`: no limit. A slot stays occupied for the entire operation, including retries and backoff. The limit counts active calls, not callbacks left running after an immediate timeout.
 
 `maxPending` defaults to `0`: no queue. When all concurrency slots are occupied, new calls reject with `QueueFullError` without invoking their callbacks. Set `maxPending > 0` to enable a queue; the limit counts only waiting calls, excluding active ones.
+
+## Circuit breaker
+
+`circuit: { threshold: 5, cooldown: 30_000 }` opens the circuit after five consecutive failed calls, counted after all retries. Success resets the count. Both settings are required; `cooldown` is in milliseconds. Without `circuit`, the breaker is disabled.
+
+While open, new and queued calls reject with `CircuitOpenError` without invoking their callbacks. Already active calls are not cancelled, but their later results do not affect the current circuit state.
+
+After cooldown, one probe call is allowed, using the runner's normal retry and timeout settings. Other calls reject until the probe finishes. Success closes the circuit; failure opens it for another full cooldown. Cancelling a probe allows another probe without closing the circuit.
+
+External cancellation, `QueueFullError` and `CircuitOpenError` neither count as failures nor reset the count. Final timeouts count as failures. With `timeoutMode: 'wait'`, a callback that never settles can also block the probe indefinitely.
+
+Circuit state is shared by all calls on a runner and independent between runners. Use a separate runner for each protected resource.
+
+## Fallback
+
+Pass `fallback` in the run options to use a backup operation after the primary call fails:
+
+```ts
+const backup = protect({ attempts: 2, timeout: 5_000 })
+const backupUrl = 'https://backup.example.com/users/1'
+
+const response = await run(({ signal }) => fetch(url, { signal }), {
+  fallback: () => backup(({ signal }) => fetch(backupUrl, { signal })),
+})
+```
+
+`fallback(error)` runs once after retries are exhausted, or immediately when the circuit or queue rejects the call. It can return a value or promise; the returned value becomes the result of `run`. It is not invoked when the primary succeeds or the external signal is aborted.
+
+Fallback does not use the primary runner's retries, timeout or concurrency slot. Use a separate runner to protect the backup operation. A successful fallback does not close the primary circuit or reset its failure count.
+
+If fallback throws or rejects, its error becomes the call's rejection. `onError` reports only the final rejection; it is not called when fallback succeeds.
+
+External cancellation also rejects a call while fallback is running. To stop the backup operation itself, forward the same external signal to its runner.
 
 ## Cancellation
 
