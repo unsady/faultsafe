@@ -266,6 +266,25 @@ it('reports failed and skipped visits in order, distinguishing open circuits and
   await probe
 })
 
+it('distinguishes resource-thrown admission errors from router admission rejections', async () => {
+  const router = createRouter({
+    providers: [{ id: 'a', resource: 'a' }],
+    protection: { circuit: { threshold: 1, cooldown: 100 } },
+  })
+  const error = new QueueFullError()
+
+  await expect(
+    router.execute(() => {
+      throw error
+    }),
+  ).rejects.toMatchObject({
+    visits: [{ providerId: 'a', status: 'failed', cause: error }],
+  })
+  await expect(router.execute(() => 'skipped')).rejects.toMatchObject({
+    visits: [{ providerId: 'a', status: 'skipped', reason: 'circuit-open' }],
+  })
+})
+
 it('replaces the default error policy per call and stops directly when failover is forbidden', async () => {
   const policy = vi.fn<RouterErrorPolicy>(() => ({
     retry: true,

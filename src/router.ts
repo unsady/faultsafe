@@ -1,7 +1,7 @@
-import { CircuitOpenError, RoutingError } from './errors.js'
-import { configureProtection } from './protection.js'
-import { execute } from './retry.js'
+import { RoutingError } from './errors.js'
+import { Protection } from './protection.js'
 import { Scheduler } from './scheduler.js'
+import { StickySelection } from './selection.js'
 import type { ExecuteOptions, Router, RouterOptions, RunContext, Visit } from './types.js'
 
 export function createRouter<Resource, const Id extends string = string>(
@@ -19,7 +19,7 @@ export function createRouter<Resource, const Id extends string = string>(
     return {
       id: provider.id,
       resource: provider.resource,
-      ...configureProtection(provider.protection, options.protection),
+      protection: new Protection(provider.protection, options.protection),
       priority: selection.type === 'priority' ? (selection.priorities?.[provider.id] ?? 0) : 0,
     }
   })
@@ -41,11 +41,21 @@ export function createRouter<Resource, const Id extends string = string>(
     throw new TypeError('Unknown selection policy')
   }
 
-  const sticky = selection.type === 'sticky'
+  const concurrency = options.concurrency ?? Infinity
+  const maxPending = options.maxPending ?? 0
+
+  if (concurrency !== Infinity && (!Number.isInteger(concurrency) || concurrency < 1)) {
+    throw new RangeError('concurrency must be a positive integer or Infinity')
+  }
+
+  if (!Number.isInteger(maxPending) || maxPending < 0) {
+    throw new RangeError('maxPending must be a non-negative integer')
+  }
+
+  const sticky =
+    selection.type === 'sticky' ? new StickySelection(first, providers.slice(1)) : undefined
   const defaultErrorPolicy = options.errorPolicy
-  const scheduler = new Scheduler(options.concurrency ?? Infinity, options.maxPending ?? 0)
-  let current = first
-  let generation = 0
+  const scheduler = new Scheduler(concurrency, maxPending)
 
   function run<Result>(
     operation: (resource: Resource, context: RunContext) => Result,
@@ -54,80 +64,43 @@ export function createRouter<Resource, const Id extends string = string>(
     const errorPolicy = executeOptions.errorPolicy ?? defaultErrorPolicy
 
     return scheduler.run(async (signal): Promise<Awaited<Result>> => {
-      const started = generation
-      const candidates = sticky
-        ? [current, ...providers.filter((provider) => provider !== current)]
-        : providers
+      const choice = sticky?.begin()
+      const candidates = choice?.candidates ?? providers
       const visits: Visit[] = []
 
       for (const provider of candidates) {
         signal.throwIfAborted()
 
-        let admission: { generation: number; probe: boolean } | undefined
+        const outcome = await provider.protection.execute(
+          (context) => operation(provider.resource, context),
+          signal,
+          errorPolicy,
+        )
 
-        try {
-          admission = provider.circuit?.enter()
-        } catch (error) {
-          if (!(error instanceof CircuitOpenError)) {
-            throw error
-          }
+        signal.throwIfAborted()
 
-          visits.push({ providerId: provider.id, status: 'skipped', reason: error.reason })
+        if ('skipped' in outcome) {
+          visits.push({
+            providerId: provider.id,
+            status: 'skipped',
+            reason: outcome.skipped.reason,
+          })
           continue
         }
 
-        function cancel(): void {
-          if (admission !== undefined) {
-            provider.circuit?.cancel(admission.generation)
+        if (outcome.ok) {
+          if (choice !== undefined) {
+            sticky?.succeed(choice.generation, provider)
           }
+
+          return outcome.value
         }
 
-        signal.addEventListener('abort', cancel, { once: true })
-
-        try {
-          const outcome = await execute(
-            (context) => operation(provider.resource, context),
-            signal,
-            {
-              ...provider.execution,
-              errorPolicy,
-            },
-          )
-
-          signal.throwIfAborted()
-
-          if (outcome.ok) {
-            if (admission !== undefined) {
-              provider.circuit?.succeed(admission.generation)
-            }
-
-            if (sticky && started === generation && current !== provider) {
-              current = provider
-              generation += 1
-            }
-
-            return outcome.value
-          }
-
-          if (admission !== undefined) {
-            if (outcome.countForCircuit) {
-              provider.circuit?.fail(admission.generation)
-            } else {
-              cancel()
-            }
-          }
-
-          if (!outcome.recoverable || !outcome.failover) {
-            throw outcome.error
-          }
-
-          visits.push({ providerId: provider.id, status: 'failed', cause: outcome.error })
-        } catch (error) {
-          cancel()
-          throw error
-        } finally {
-          signal.removeEventListener('abort', cancel)
+        if (!outcome.recoverable || !outcome.failover) {
+          throw outcome.error
         }
+
+        visits.push({ providerId: provider.id, status: 'failed', cause: outcome.error })
       }
 
       throw new RoutingError(visits)

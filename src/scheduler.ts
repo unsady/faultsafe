@@ -2,6 +2,7 @@ import { QueueFullError } from './errors.js'
 
 interface PendingOperation {
   start: () => void
+  reject: (error: unknown) => void
 }
 
 export class Scheduler {
@@ -11,13 +12,11 @@ export class Scheduler {
   constructor(
     private readonly concurrency: number,
     private readonly maxPending: number,
-  ) {
-    if (concurrency !== Infinity && (!Number.isInteger(concurrency) || concurrency < 1)) {
-      throw new RangeError('concurrency must be a positive integer or Infinity')
-    }
+  ) {}
 
-    if (!Number.isInteger(maxPending) || maxPending < 0) {
-      throw new RangeError('maxPending must be a non-negative integer')
+  rejectPending(error: unknown): void {
+    for (const entry of this.pending) {
+      entry.reject(error)
     }
   }
 
@@ -35,10 +34,14 @@ export class Scheduler {
         reject(signal.reason)
       }
 
-      const cancelPending = (): void => {
+      const rejectPending = (error: unknown): void => {
         this.pending.delete(entry)
         signal.removeEventListener('abort', cancelPending)
-        reject(signal.reason)
+        reject(error)
+      }
+
+      function cancelPending(): void {
+        rejectPending(signal.reason)
       }
 
       const start = (): void => {
@@ -74,7 +77,8 @@ export class Scheduler {
           finish()
         }
       }
-      const entry = { start }
+
+      const entry = { start, reject: rejectPending }
 
       if (this.active < this.concurrency && this.pending.size === 0) {
         start()

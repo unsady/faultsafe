@@ -13,7 +13,7 @@ export interface ExecutionOptions {
   errorPolicy: ((error: unknown) => ExecutionDecision) | undefined
 }
 
-type ExecutionResult<Result> =
+export type ExecutionResult<Result> =
   | { ok: true; value: Awaited<Result> }
   | {
       ok: false
