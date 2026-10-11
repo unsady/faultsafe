@@ -1,8 +1,10 @@
-export { CircuitOpenError, QueueFullError, TimeoutError } from './errors.js'
+export { CircuitOpenError, ErrorPolicyError, QueueFullError, TimeoutError } from './errors.js'
 export { protect } from './protect.js'
 export type {
   BackoffOptions,
   CircuitOptions,
+  ErrorDecision,
+  ErrorPolicy,
   ProtectOptions,
   RunContext,
   Runner,

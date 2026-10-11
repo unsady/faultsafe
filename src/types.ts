@@ -11,6 +11,13 @@ export interface CircuitOptions {
 
 export type TimeoutMode = 'immediate' | 'wait'
 
+export interface ErrorDecision {
+  retry: boolean
+  countForCircuit: boolean
+}
+
+export type ErrorPolicy = (error: unknown) => ErrorDecision
+
 export interface ProtectOptions {
   attempts?: number
   backoff?: BackoffOptions
@@ -19,7 +26,7 @@ export interface ProtectOptions {
   concurrency?: number
   maxPending?: number
   circuit?: CircuitOptions
-  onError?: (error: unknown) => void
+  errorPolicy?: ErrorPolicy
 }
 
 export interface RunContext {
@@ -28,7 +35,8 @@ export interface RunContext {
 
 export interface RunOptions<Result = unknown> {
   signal?: AbortSignal
-  fallback?: (error: unknown) => Result
+  errorPolicy?: ErrorPolicy
+  fallback?: (error: unknown, context: RunContext) => Result
 }
 
 export interface Runner {

@@ -5,6 +5,13 @@ export class CircuitOpenError extends Error {
   }
 }
 
+export class ErrorPolicyError extends AggregateError {
+  constructor(error: unknown, policyError: unknown) {
+    super([error, policyError], 'The error policy threw', { cause: error })
+    this.name = 'ErrorPolicyError'
+  }
+}
+
 export class QueueFullError extends Error {
   constructor() {
     super('The pending operation limit has been reached')
