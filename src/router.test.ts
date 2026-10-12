@@ -72,6 +72,21 @@ it('uses registration order by default and breaks equal priorities with that ord
   await expect(tied.execute((resource) => resource)).resolves.toBe('a')
 })
 
+it.each(['toString', 'constructor', '__proto__'])(
+  'ignores inherited priorities for provider %s',
+  async (id) => {
+    const router = createRouter({
+      providers: [
+        { id, resource: id },
+        { id: 'preferred', resource: 'preferred' },
+      ],
+      selection: { type: 'priority', priorities: { preferred: 10 } },
+    })
+
+    await expect(router.execute((resource) => resource)).resolves.toBe('preferred')
+  },
+)
+
 it('inherits protection, replaces nested settings and can disable an inherited circuit', async () => {
   vi.spyOn(Math, 'random').mockReturnValue(0.5)
 
@@ -559,6 +574,18 @@ it('waits for a timed-out callback before failing over and releasing its slot', 
   await expect(running).resolves.toBe('b')
   await expect(waiting).resolves.toBe('b')
   expect(visits).toEqual(['a', 'b'])
+})
+
+it('supports an unbounded pending limit', async () => {
+  const router = createRouter({ providers, concurrency: 1, maxPending: Infinity })
+  const blocker = deferred()
+  const active = router.execute(() => blocker.promise)
+  const first = router.execute(() => 'first')
+  const second = router.execute(() => 'second')
+
+  blocker.resolve()
+  await active
+  await expect(Promise.all([first, second])).resolves.toEqual(['first', 'second'])
 })
 
 describe('configuration', () => {

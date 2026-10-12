@@ -8,6 +8,7 @@ export function createRouter<Resource, const Id extends string = string>(
   options: RouterOptions<Resource, Id>,
 ): Router<Resource> {
   const selection = options.selection ?? { type: 'priority' }
+  const priorities = selection.type === 'priority' ? selection.priorities : undefined
   const ids = new Set<string>()
   const providers = options.providers.map((provider) => {
     if (provider.id.length === 0 || ids.has(provider.id)) {
@@ -20,7 +21,10 @@ export function createRouter<Resource, const Id extends string = string>(
       id: provider.id,
       resource: provider.resource,
       protection: new Protection(provider.protection, options.protection),
-      priority: selection.type === 'priority' ? (selection.priorities?.[provider.id] ?? 0) : 0,
+      priority:
+        priorities !== undefined && Object.hasOwn(priorities, provider.id)
+          ? (priorities[provider.id] ?? 0)
+          : 0,
     }
   })
   const first = providers[0]
@@ -30,7 +34,7 @@ export function createRouter<Resource, const Id extends string = string>(
   }
 
   if (selection.type === 'priority') {
-    for (const [id, priority] of Object.entries(selection.priorities ?? {})) {
+    for (const [id, priority] of Object.entries(priorities ?? {})) {
       if (!ids.has(id) || !Number.isFinite(priority)) {
         throw new TypeError('Priorities must reference registered providers and be finite')
       }
@@ -41,21 +45,10 @@ export function createRouter<Resource, const Id extends string = string>(
     throw new TypeError('Unknown selection policy')
   }
 
-  const concurrency = options.concurrency ?? Infinity
-  const maxPending = options.maxPending ?? 0
-
-  if (concurrency !== Infinity && (!Number.isInteger(concurrency) || concurrency < 1)) {
-    throw new RangeError('concurrency must be a positive integer or Infinity')
-  }
-
-  if (!Number.isInteger(maxPending) || maxPending < 0) {
-    throw new RangeError('maxPending must be a non-negative integer')
-  }
-
   const sticky =
     selection.type === 'sticky' ? new StickySelection(first, providers.slice(1)) : undefined
   const defaultErrorPolicy = options.errorPolicy
-  const scheduler = new Scheduler(concurrency, maxPending)
+  const scheduler = new Scheduler(options.concurrency ?? Infinity, options.maxPending ?? 0)
 
   function run<Result>(
     operation: (resource: Resource, context: RunContext) => Result,

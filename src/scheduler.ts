@@ -12,7 +12,15 @@ export class Scheduler {
   constructor(
     private readonly concurrency: number,
     private readonly maxPending: number,
-  ) {}
+  ) {
+    if (concurrency !== Infinity && (!Number.isInteger(concurrency) || concurrency < 1)) {
+      throw new RangeError('concurrency must be a positive integer or Infinity')
+    }
+
+    if (maxPending !== Infinity && (!Number.isInteger(maxPending) || maxPending < 0)) {
+      throw new RangeError('maxPending must be a non-negative integer or Infinity')
+    }
+  }
 
   rejectPending(error: unknown): void {
     for (const entry of this.pending) {

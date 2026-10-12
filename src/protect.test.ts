@@ -29,6 +29,14 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
+it.each([0, -1, 1.5, NaN, -Infinity])('rejects invalid concurrency %s', (concurrency) => {
+  expect(() => protect({ concurrency })).toThrow(RangeError)
+})
+
+it.each([-1, 1.5, NaN, -Infinity])('rejects invalid pending limit %s', (maxPending) => {
+  expect(() => protect({ maxPending })).toThrow(RangeError)
+})
+
 it('returns operation results and does not retry by default', async () => {
   const run = protect()
   const error = new Error('failed')
