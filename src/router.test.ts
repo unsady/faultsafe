@@ -576,6 +576,18 @@ it('waits for a timed-out callback before failing over and releasing its slot', 
   expect(visits).toEqual(['a', 'b'])
 })
 
+it('supports an unbounded pending limit', async () => {
+  const router = createRouter({ providers, concurrency: 1, maxPending: Infinity })
+  const blocker = deferred()
+  const active = router.execute(() => blocker.promise)
+  const first = router.execute(() => 'first')
+  const second = router.execute(() => 'second')
+
+  blocker.resolve()
+  await active
+  await expect(Promise.all([first, second])).resolves.toEqual(['first', 'second'])
+})
+
 describe('configuration', () => {
   it.each<{ name: string; options: Partial<RouterOptions<string>> }>([
     { name: 'empty providers', options: { providers: [] } },

@@ -72,7 +72,7 @@ Supported selection policies:
 - `{ type: 'priority', priorities?: { ... } }` (default): highest priority first. Missing priorities are `0`; ties use registration order. After cooldown, a preferred provider can receive one recovery probe while other requests use alternatives.
 - `{ type: 'sticky' }`: keep the successful provider until it fails or rejects circuit admission. Start with the first registered provider, then try other providers in registration order. The first successful switch from a selection generation wins; late results cannot overwrite a newer choice.
 
-Provider `protection` inherits shared settings. Nested `backoff` and `circuit` objects replace the inherited object entirely; `circuit: false` disables an inherited breaker. Provider IDs must be non-empty and unique. Explicit priority keys must identify registered providers, and values must be finite. Router concurrency must be a positive integer or `Infinity`, and `maxPending` a non-negative integer.
+Provider `protection` inherits shared settings. Nested `backoff` and `circuit` objects replace the inherited object entirely; `circuit: false` disables an inherited breaker. Provider IDs must be non-empty and unique. Explicit priority keys must identify registered providers, and values must be finite. Both `protect()` and router require concurrency to be a positive integer or `Infinity`, and `maxPending` a non-negative integer or `Infinity`.
 
 A router's `errorPolicy`, or its replacement in `execute` options, returns `retry`, `failover` and `countForCircuit`. All three default to `true`. `failover` permits switching after local retries finish or are disabled. Circuit rejection skips a provider without running the policy. An error with `failover: false` rejects directly, and a policy exception rejects with `ErrorPolicyError` without switching.
 
@@ -132,7 +132,7 @@ To limit the entire call, including queue wait and backoff, pass an external sig
 
 `concurrency` defaults to `Infinity`: no limit. A slot stays occupied for the entire operation, including retries and backoff. The limit counts active calls, not callbacks left running after an immediate timeout.
 
-`maxPending` defaults to `0`: no queue. When all concurrency slots are occupied, new calls reject with `QueueFullError` without invoking their callbacks. Set `maxPending > 0` to enable a queue; the limit counts only waiting calls, excluding active ones.
+`maxPending` defaults to `0`: no queue. When all concurrency slots are occupied, new calls reject with `QueueFullError` without invoking their callbacks. Set `maxPending > 0` to enable a queue; the limit counts only waiting calls, excluding active ones. Use `Infinity` for an unbounded queue.
 
 ## Circuit breaker
 

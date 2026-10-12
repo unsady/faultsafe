@@ -45,21 +45,10 @@ export function createRouter<Resource, const Id extends string = string>(
     throw new TypeError('Unknown selection policy')
   }
 
-  const concurrency = options.concurrency ?? Infinity
-  const maxPending = options.maxPending ?? 0
-
-  if (concurrency !== Infinity && (!Number.isInteger(concurrency) || concurrency < 1)) {
-    throw new RangeError('concurrency must be a positive integer or Infinity')
-  }
-
-  if (!Number.isInteger(maxPending) || maxPending < 0) {
-    throw new RangeError('maxPending must be a non-negative integer')
-  }
-
   const sticky =
     selection.type === 'sticky' ? new StickySelection(first, providers.slice(1)) : undefined
   const defaultErrorPolicy = options.errorPolicy
-  const scheduler = new Scheduler(concurrency, maxPending)
+  const scheduler = new Scheduler(options.concurrency ?? Infinity, options.maxPending ?? 0)
 
   function run<Result>(
     operation: (resource: Resource, context: RunContext) => Result,
