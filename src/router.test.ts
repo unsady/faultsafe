@@ -72,6 +72,21 @@ it('uses registration order by default and breaks equal priorities with that ord
   await expect(tied.execute((resource) => resource)).resolves.toBe('a')
 })
 
+it.each(['toString', 'constructor', '__proto__'])(
+  'ignores inherited priorities for provider %s',
+  async (id) => {
+    const router = createRouter({
+      providers: [
+        { id, resource: id },
+        { id: 'preferred', resource: 'preferred' },
+      ],
+      selection: { type: 'priority', priorities: { preferred: 10 } },
+    })
+
+    await expect(router.execute((resource) => resource)).resolves.toBe('preferred')
+  },
+)
+
 it('inherits protection, replaces nested settings and can disable an inherited circuit', async () => {
   vi.spyOn(Math, 'random').mockReturnValue(0.5)
 

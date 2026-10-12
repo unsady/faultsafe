@@ -8,6 +8,7 @@ export function createRouter<Resource, const Id extends string = string>(
   options: RouterOptions<Resource, Id>,
 ): Router<Resource> {
   const selection = options.selection ?? { type: 'priority' }
+  const priorities = selection.type === 'priority' ? selection.priorities : undefined
   const ids = new Set<string>()
   const providers = options.providers.map((provider) => {
     if (provider.id.length === 0 || ids.has(provider.id)) {
@@ -20,7 +21,10 @@ export function createRouter<Resource, const Id extends string = string>(
       id: provider.id,
       resource: provider.resource,
       protection: new Protection(provider.protection, options.protection),
-      priority: selection.type === 'priority' ? (selection.priorities?.[provider.id] ?? 0) : 0,
+      priority:
+        priorities !== undefined && Object.hasOwn(priorities, provider.id)
+          ? (priorities[provider.id] ?? 0)
+          : 0,
     }
   })
   const first = providers[0]
@@ -30,7 +34,7 @@ export function createRouter<Resource, const Id extends string = string>(
   }
 
   if (selection.type === 'priority') {
-    for (const [id, priority] of Object.entries(selection.priorities ?? {})) {
+    for (const [id, priority] of Object.entries(priorities ?? {})) {
       if (!ids.has(id) || !Number.isFinite(priority)) {
         throw new TypeError('Priorities must reference registered providers and be finite')
       }
