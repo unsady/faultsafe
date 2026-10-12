@@ -20,7 +20,7 @@ export class Circuit {
     }
 
     if (this.state === 'half-open' && this.probing) {
-      throw new CircuitOpenError()
+      throw new CircuitOpenError('probe-busy')
     }
   }
 

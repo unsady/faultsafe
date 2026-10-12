@@ -2,9 +2,11 @@ import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'v
 
 import {
   CircuitOpenError,
+  ErrorPolicyError,
   protect,
   QueueFullError,
   TimeoutError,
+  type ErrorPolicy,
   type RunContext,
 } from './index.js'
 
@@ -52,18 +54,16 @@ it('retries immediately without backoff and returns the successful result', asyn
   expect(operation).toHaveBeenCalledTimes(3)
 })
 
-it('stops at the attempt limit and reports the final error once', async () => {
+it('stops at the attempt limit with exponential backoff', async () => {
   const error = new Error('unavailable')
   const times: number[] = []
   const operation = vi.fn<() => Promise<void>>(() => {
     times.push(Date.now())
     return Promise.reject(error)
   })
-  const onError = vi.fn<(error: unknown) => void>()
   const run = protect({
     attempts: 4,
     backoff: { type: 'exponential', delay: 10 },
-    onError,
   })
   const rejected = run(operation).catch((error: unknown) => error)
 
@@ -72,7 +72,6 @@ it('stops at the attempt limit and reports the final error once', async () => {
 
   expect(operation).toHaveBeenCalledTimes(4)
   expect(times).toEqual([0, 10, 30, 70])
-  expect(onError.mock.calls).toEqual([[error]])
 })
 
 it.each<{ type: 'fixed' | 'exponential'; secondDelay: number }>([
@@ -105,7 +104,8 @@ it.each<{ type: 'fixed' | 'exponential'; secondDelay: number }>([
 })
 
 it('rejects excess calls without queuing by default', async () => {
-  const run = protect({ concurrency: 1 })
+  const policy = vi.fn<ErrorPolicy>(() => ({ retry: true, countForCircuit: true }))
+  const run = protect({ concurrency: 1, errorPolicy: policy })
   const blocker = deferred()
   const running = run(() => blocker.promise)
   const overflow = vi.fn<() => string>(() => 'saved')
@@ -116,6 +116,20 @@ it('rejects excess calls without queuing by default', async () => {
   blocker.resolve()
   await running
   await expect(run(overflow)).resolves.toBe('saved')
+  expect(policy).not.toHaveBeenCalled()
+})
+
+it('supports an unbounded pending limit', async () => {
+  const run = protect({ concurrency: 1, maxPending: Infinity })
+  const blocker = deferred()
+  const active = run(() => blocker.promise)
+  const first = run(() => 'first')
+  const second = run(() => 'second')
+
+  blocker.resolve()
+  await active
+  await expect(first).resolves.toBe('first')
+  await expect(second).resolves.toBe('second')
 })
 
 it('shares concurrency and pending limits across operations and releases a slot after failure', async () => {
@@ -145,7 +159,8 @@ it('shares concurrency and pending limits across operations and releases a slot 
 })
 
 it('skips already aborted operations and frees a pending slot on cancellation', async () => {
-  const run = protect({ concurrency: 1, maxPending: 1 })
+  const policy = vi.fn<ErrorPolicy>(() => ({ retry: true, countForCircuit: true }))
+  const run = protect({ concurrency: 1, maxPending: 1, errorPolicy: policy })
   const controller = new AbortController()
   const reason = new Error('cancelled')
   const skipped = vi.fn<() => void>()
@@ -165,10 +180,12 @@ it('skips already aborted operations and frees a pending slot on cancellation', 
   await running
   await expect(replacement).resolves.toBe('replacement')
   expect(skipped).not.toHaveBeenCalled()
+  expect(policy).not.toHaveBeenCalled()
 })
 
 it('forwards cancellation without releasing the slot until the operation settles or retrying it', async () => {
-  const run = protect({ concurrency: 1, maxPending: 1, attempts: 3 })
+  const policy = vi.fn<ErrorPolicy>(() => ({ retry: true, countForCircuit: true }))
+  const run = protect({ concurrency: 1, maxPending: 1, attempts: 3, errorPolicy: policy })
   const controller = new AbortController()
   const blocker = deferred()
   const reason = new Error('cancelled')
@@ -190,6 +207,7 @@ it('forwards cancellation without releasing the slot until the operation settles
   blocker.resolve()
   await expect(waiting).resolves.toBe('next')
   expect(operation).toHaveBeenCalledTimes(1)
+  expect(policy).not.toHaveBeenCalled()
 })
 
 it('gives each attempt its own timeout, excluding backoff and queue wait', async () => {
@@ -238,13 +256,11 @@ it('gives each attempt its own timeout, excluding backoff and queue wait', async
 })
 
 it('releases the slot on the final timeout and ignores a late callback rejection', async () => {
-  const onError = vi.fn<(error: unknown) => void>()
   const run = protect({
     concurrency: 1,
     maxPending: 1,
     timeout: 100,
     timeoutMode: 'immediate',
-    onError,
   })
   const blocker = deferred()
   const timedOut = run(async () => {
@@ -259,18 +275,15 @@ it('releases the slot on the final timeout and ignores a late callback rejection
 
   blocker.resolve()
   await vi.advanceTimersByTimeAsync(0)
-  expect(onError).toHaveBeenCalledTimes(1)
 })
 
 it('waits for timed-out callbacks before retrying or releasing the slot in wait mode', async () => {
-  const onError = vi.fn<(error: unknown) => void>()
   const run = protect({
     concurrency: 1,
     maxPending: 1,
     attempts: 2,
     timeout: 100,
     timeoutMode: 'wait',
-    onError,
   })
   const first = deferred()
   const second = deferred()
@@ -291,19 +304,135 @@ it('waits for timed-out callbacks before retrying or releasing the slot in wait 
   await vi.advanceTimersByTimeAsync(100)
   expect(signals[1]?.reason).toBeInstanceOf(TimeoutError)
   expect(operation).toHaveBeenCalledTimes(2)
-  expect(onError).not.toHaveBeenCalled()
   expect(next).not.toHaveBeenCalled()
 
   second.resolve()
   await expect(timedOut).resolves.toBeInstanceOf(TimeoutError)
   await expect(waiting).resolves.toBe('next')
-  expect(onError).toHaveBeenCalledTimes(1)
+})
+
+describe('error policy', () => {
+  it('replaces the runner policy per call and classifies the final error independently', async () => {
+    const error = new Error('provider failed')
+    const excluded = new Error('invalid input')
+    const policy = vi.fn<ErrorPolicy>(() => ({ retry: false, countForCircuit: true }))
+    const override = vi.fn<ErrorPolicy>((failure) => ({
+      retry: failure === error,
+      countForCircuit: failure === error,
+    }))
+    const run = protect({
+      attempts: 3,
+      circuit: { threshold: 1, cooldown: 100 },
+      errorPolicy: policy,
+    })
+    const operation = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(error)
+      .mockRejectedValue(excluded)
+
+    await expect(run(operation, { errorPolicy: override })).rejects.toBe(excluded)
+    expect(operation).toHaveBeenCalledTimes(2)
+    expect(override.mock.calls).toEqual([[error], [excluded]])
+    expect(policy).not.toHaveBeenCalled()
+
+    await expect(run(operation)).rejects.toBe(excluded)
+    expect(operation).toHaveBeenCalledTimes(3)
+    expect(policy.mock.calls).toEqual([[excluded]])
+    await expect(run(operation)).rejects.toBeInstanceOf(CircuitOpenError)
+    expect(policy).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves counted failures across neutral errors and permits an immediate replacement probe', async () => {
+    const error = new Error('provider failed')
+    const excluded = new Error('invalid input')
+    const run = protect({
+      circuit: { threshold: 2, cooldown: 100 },
+      errorPolicy: (failure) => ({ retry: false, countForCircuit: failure === error }),
+    })
+
+    function fail(): never {
+      throw error
+    }
+
+    function neutral(): never {
+      throw excluded
+    }
+
+    await expect(run(fail)).rejects.toBe(error)
+    await expect(run(neutral)).rejects.toBe(excluded)
+    await expect(run(fail)).rejects.toBe(error)
+    await expect(run(() => 'skipped')).rejects.toBeInstanceOf(CircuitOpenError)
+    await vi.advanceTimersByTimeAsync(100)
+    await expect(run(neutral)).rejects.toBe(excluded)
+
+    const blocker = deferred()
+    const probe = run(() => blocker.promise)
+
+    await expect(run(() => 'skipped')).rejects.toBeInstanceOf(CircuitOpenError)
+    blocker.resolve()
+    await probe
+    await expect(run(() => 'saved')).resolves.toBe('saved')
+  })
+
+  it('preserves both errors when the policy throws, skips fallback and releases the probe and slot', async () => {
+    const error = new Error('provider failed')
+    const policyError = new Error('policy failed')
+    const run = protect({
+      concurrency: 1,
+      attempts: 3,
+      circuit: { threshold: 1, cooldown: 100 },
+    })
+    const operation = vi.fn<() => never>(() => {
+      throw error
+    })
+
+    await expect(run(operation)).rejects.toBe(error)
+    await vi.advanceTimersByTimeAsync(100)
+    operation.mockClear()
+
+    const policy = vi.fn<ErrorPolicy>(() => {
+      throw policyError
+    })
+    const fallback = vi.fn<() => string>(() => 'backup')
+    const failure = await run(operation, { errorPolicy: policy, fallback }).catch(
+      (error: unknown) => error,
+    )
+
+    expect(failure).toBeInstanceOf(ErrorPolicyError)
+    expect(failure).toMatchObject({ errors: [error, policyError], cause: error })
+    expect(operation).toHaveBeenCalledTimes(1)
+    expect(policy).toHaveBeenCalledTimes(1)
+    expect(fallback).not.toHaveBeenCalled()
+
+    const blocker = deferred()
+    const probe = run(() => blocker.promise)
+
+    await expect(run(() => 'skipped')).rejects.toBeInstanceOf(CircuitOpenError)
+    blocker.resolve()
+    await probe
+    await expect(run(() => 'saved')).resolves.toBe('saved')
+  })
+
+  it('allows fallback even when retries are disabled', async () => {
+    const error = new Error('invalid input')
+    const run = protect({
+      attempts: 3,
+      errorPolicy: () => ({ retry: false, countForCircuit: false }),
+    })
+    const operation = vi.fn<() => never>(() => {
+      throw error
+    })
+    const fallback = vi.fn<() => string>(() => 'cached')
+
+    await expect(run(operation, { fallback })).resolves.toBe('cached')
+    expect(operation).toHaveBeenCalledTimes(1)
+    expect(fallback).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('fallback', () => {
   it('runs only after final failure and returns an awaited, correctly typed result', async () => {
-    const onError = vi.fn<(error: unknown) => void>()
-    const run = protect({ attempts: 3, onError })
+    const run = protect({ attempts: 3 })
     const error = new Error('primary failed')
     const operation = vi.fn<() => Promise<string>>().mockRejectedValue(error)
     const fallback = vi.fn<(error: unknown) => Promise<number>>(async () => 42)
@@ -316,16 +445,14 @@ describe('fallback', () => {
     expectTypeOf(result).toEqualTypeOf<Promise<string | number>>()
     await expect(result).resolves.toBe(42)
     expect(operation).toHaveBeenCalledTimes(3)
-    expect(fallback.mock.calls).toEqual([[error]])
-    expect(onError).not.toHaveBeenCalled()
+    expect(fallback.mock.calls[0]?.[0]).toBe(error)
     expectTypeOf(run(() => 'primary')).toEqualTypeOf<Promise<string>>()
   })
 
   it.each(['throw', 'reject'] as const)(
     'reports a fallback %s without retrying it',
     async (mode) => {
-      const onError = vi.fn<(error: unknown) => void>()
-      const run = protect({ attempts: 3, onError })
+      const run = protect({ attempts: 3 })
       const error = new Error('backup failed')
       const fallback = vi.fn<(error: unknown) => Promise<never>>(() => {
         if (mode === 'throw') {
@@ -344,13 +471,11 @@ describe('fallback', () => {
         ),
       ).rejects.toBe(error)
       expect(fallback).toHaveBeenCalledTimes(1)
-      expect(onError.mock.calls).toEqual([[error]])
     },
   )
 
   it('can use a backup runner without closing the primary circuit', async () => {
-    const onError = vi.fn<(error: unknown) => void>()
-    const run = protect({ circuit: { threshold: 1, cooldown: 100 }, onError })
+    const run = protect({ circuit: { threshold: 1, cooldown: 100 } })
     const backup = protect({ attempts: 2, circuit: { threshold: 1, cooldown: 100 } })
     const error = new Error('primary failed')
     const operation = vi
@@ -362,23 +487,33 @@ describe('fallback', () => {
     await expect(run(operation, { fallback })).resolves.toBe('backup')
     await expect(run(operation, { fallback })).resolves.toBe('backup')
     expect(operation).toHaveBeenCalledTimes(1)
-    expect(fallback.mock.calls[0]).toEqual([error])
+    expect(fallback.mock.calls[0]?.[0]).toBe(error)
     expect(fallback.mock.calls[1]?.[0]).toBeInstanceOf(CircuitOpenError)
 
     await vi.advanceTimersByTimeAsync(100)
     await expect(run(operation, { fallback })).resolves.toBe('primary')
     expect(fallback).toHaveBeenCalledTimes(2)
-    expect(onError).not.toHaveBeenCalled()
   })
 
   it('handles final timeout outside the primary concurrency slot and timeout budget', async () => {
-    const run = protect({ concurrency: 1, timeout: 100 })
+    const policy = vi.fn<ErrorPolicy>(() => ({ retry: false, countForCircuit: false }))
+    const run = protect({
+      concurrency: 1,
+      attempts: 3,
+      timeout: 100,
+      circuit: { threshold: 1, cooldown: 100 },
+      errorPolicy: policy,
+    })
     const primary = deferred()
     const backup = deferred()
-    const fallback = vi.fn<(error: unknown) => Promise<number>>(async () => {
-      await backup.promise
-      return 42
-    })
+    let received: AbortSignal | undefined
+    const fallback = vi.fn<(error: unknown, context: RunContext) => Promise<number>>(
+      async (_error, { signal }) => {
+        received = signal
+        await backup.promise
+        return 42
+      },
+    )
     const result = run(
       async () => {
         await primary.promise
@@ -389,6 +524,10 @@ describe('fallback', () => {
 
     await vi.advanceTimersByTimeAsync(100)
     expect(fallback.mock.calls[0]?.[0]).toBeInstanceOf(TimeoutError)
+    expect(policy.mock.calls[0]?.[0]).toBeInstanceOf(TimeoutError)
+    expect(policy).toHaveBeenCalledTimes(1)
+    expect(received).toBeInstanceOf(AbortSignal)
+    expect(received?.aborted).toBe(false)
     await expect(run(() => 'primary')).resolves.toBe('primary')
     await vi.advanceTimersByTimeAsync(1_000)
 
@@ -447,15 +586,18 @@ describe('fallback', () => {
   })
 
   it('cancels an active fallback and ignores its late rejection', async () => {
-    const onError = vi.fn<(error: unknown) => void>()
-    const run = protect({ onError })
+    const run = protect()
     const controller = new AbortController()
     const blocker = deferred()
     const reason = new Error('cancelled')
-    const fallback = vi.fn<(error: unknown) => Promise<never>>(async () => {
-      await blocker.promise
-      throw new Error('late')
-    })
+    let received: AbortSignal | undefined
+    const fallback = vi.fn<(error: unknown, context: RunContext) => Promise<never>>(
+      async (_error, { signal }) => {
+        received = signal
+        await blocker.promise
+        throw new Error('late')
+      },
+    )
     const cancelled = run(
       () => {
         throw new Error('primary failed')
@@ -465,12 +607,13 @@ describe('fallback', () => {
 
     await vi.advanceTimersByTimeAsync(0)
     expect(fallback).toHaveBeenCalledTimes(1)
+    expect(received).toBe(controller.signal)
     controller.abort(reason)
     await expect(cancelled).resolves.toBe(reason)
+    expect(received?.reason).toBe(reason)
 
     blocker.resolve()
     await vi.advanceTimersByTimeAsync(0)
-    expect(onError.mock.calls).toEqual([[reason]])
   })
 })
 
@@ -592,16 +735,33 @@ describe('circuit', () => {
     expect(skipped).not.toHaveBeenCalled()
   })
 
-  it('counts only the final timeout and ignores detached callbacks and hook errors', async () => {
-    const hookError = new Error('hook failed')
-    const onError = vi.fn<(error: unknown) => void>(() => {
-      throw hookError
-    })
+  it('keeps operation-thrown admission errors neutral without resetting prior failures', async () => {
+    const run = protect({ circuit: { threshold: 2, cooldown: 100 } })
+    const error = new Error('unavailable')
+
+    function fail(): never {
+      throw error
+    }
+
+    await expect(run(fail)).rejects.toBe(error)
+
+    for (const admissionError of [new QueueFullError(), new CircuitOpenError()]) {
+      await expect(
+        run(() => {
+          throw admissionError
+        }),
+      ).rejects.toBe(admissionError)
+    }
+
+    await expect(run(fail)).rejects.toBe(error)
+    await expect(run(() => 'skipped')).rejects.toBeInstanceOf(CircuitOpenError)
+  })
+
+  it('counts only the final timeout and ignores detached callbacks', async () => {
     const run = protect({
       attempts: 2,
       timeout: 100,
       circuit: { threshold: 1, cooldown: 100 },
-      onError,
     })
     const blocker = deferred()
     const timedOut = run(() => blocker.promise).catch((error: unknown) => error)
@@ -609,16 +769,13 @@ describe('circuit', () => {
     await vi.advanceTimersByTimeAsync(100)
     await expect(run(() => 'available')).resolves.toBe('available')
     await vi.advanceTimersByTimeAsync(100)
-    await expect(timedOut).resolves.toBe(hookError)
-    expect(onError).toHaveBeenCalledTimes(1)
-    expect(onError.mock.calls[0]?.[0]).toBeInstanceOf(TimeoutError)
+    await expect(timedOut).resolves.toBeInstanceOf(TimeoutError)
 
     blocker.resolve()
     await vi.advanceTimersByTimeAsync(0)
     const skipped = vi.fn<() => void>()
 
-    await expect(run(skipped)).rejects.toBe(hookError)
-    expect(onError.mock.calls[1]?.[0]).toBeInstanceOf(CircuitOpenError)
+    await expect(run(skipped)).rejects.toBeInstanceOf(CircuitOpenError)
     expect(skipped).not.toHaveBeenCalled()
   })
 

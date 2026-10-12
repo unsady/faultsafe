@@ -11,15 +11,25 @@ export interface CircuitOptions {
 
 export type TimeoutMode = 'immediate' | 'wait'
 
-export interface ProtectOptions {
+export interface ErrorDecision {
+  retry: boolean
+  countForCircuit: boolean
+}
+
+export type ErrorPolicy = (error: unknown) => ErrorDecision
+
+export interface ProtectionOptions {
   attempts?: number
   backoff?: BackoffOptions
   timeout?: number
   timeoutMode?: TimeoutMode
+  circuit?: CircuitOptions | false
+}
+
+export interface ProtectOptions extends ProtectionOptions {
   concurrency?: number
   maxPending?: number
-  circuit?: CircuitOptions
-  onError?: (error: unknown) => void
+  errorPolicy?: ErrorPolicy
 }
 
 export interface RunContext {
@@ -28,8 +38,50 @@ export interface RunContext {
 
 export interface RunOptions<Result = unknown> {
   signal?: AbortSignal
-  fallback?: (error: unknown) => Result
+  errorPolicy?: ErrorPolicy
+  fallback?: (error: unknown, context: RunContext) => Result
 }
+
+export interface RouterErrorDecision extends ErrorDecision {
+  failover: boolean
+}
+
+export type RouterErrorPolicy = (error: unknown) => RouterErrorDecision
+
+export interface Provider<Resource, Id extends string = string> {
+  id: Id
+  resource: Resource
+  protection?: ProtectionOptions
+}
+
+export type Selection<Id extends string = string> =
+  | { type: 'priority'; priorities?: Readonly<Partial<Record<Id, number>>> }
+  | { type: 'sticky' }
+
+export interface RouterOptions<Resource, Id extends string = string> {
+  providers: readonly Provider<Resource, Id>[]
+  protection?: ProtectionOptions
+  selection?: Selection<NoInfer<Id>>
+  errorPolicy?: RouterErrorPolicy
+  concurrency?: number
+  maxPending?: number
+}
+
+export interface ExecuteOptions {
+  signal?: AbortSignal
+  errorPolicy?: RouterErrorPolicy
+}
+
+export interface Router<Resource> {
+  execute<Result>(
+    operation: (resource: Resource, context: RunContext) => Result,
+    options?: ExecuteOptions,
+  ): Promise<Awaited<Result>>
+}
+
+export type Visit =
+  | { providerId: string; status: 'failed'; cause: unknown }
+  | { providerId: string; status: 'skipped'; reason: 'circuit-open' | 'probe-busy' }
 
 export interface Runner {
   <Result, Fallback = never>(
