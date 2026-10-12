@@ -1,7 +1,6 @@
 {
   "name": "faultsafe",
   "version": "0.1.0",
-  "private": true,
   "description": "Resilience for ordinary async functions.",
   "homepage": "https://github.com/unsady/faultsafe",
   "bugs": {
@@ -24,7 +23,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint --config oxlint.config.ts",
     "format": "oxfmt --config oxfmt.config.ts --write .",
