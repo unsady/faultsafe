@@ -29,6 +29,14 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
+it.each([0, -1, 1.5, NaN, -Infinity])('rejects invalid concurrency %s', (concurrency) => {
+  expect(() => protect({ concurrency })).toThrow(RangeError)
+})
+
+it.each([-1, 1.5, NaN, -Infinity])('rejects invalid pending limit %s', (maxPending) => {
+  expect(() => protect({ maxPending })).toThrow(RangeError)
+})
+
 it('returns operation results and does not retry by default', async () => {
   const run = protect()
   const error = new Error('failed')
@@ -117,6 +125,19 @@ it('rejects excess calls without queuing by default', async () => {
   await running
   await expect(run(overflow)).resolves.toBe('saved')
   expect(policy).not.toHaveBeenCalled()
+})
+
+it('supports an unbounded pending limit', async () => {
+  const run = protect({ concurrency: 1, maxPending: Infinity })
+  const blocker = deferred()
+  const active = run(() => blocker.promise)
+  const first = run(() => 'first')
+  const second = run(() => 'second')
+
+  blocker.resolve()
+  await active
+  await expect(first).resolves.toBe('first')
+  await expect(second).resolves.toBe('second')
 })
 
 it('shares concurrency and pending limits across operations and releases a slot after failure', async () => {
@@ -720,6 +741,28 @@ describe('circuit', () => {
     await expect(run(fail)).rejects.toBe(error)
     await expect(run(skipped)).rejects.toBeInstanceOf(CircuitOpenError)
     expect(skipped).not.toHaveBeenCalled()
+  })
+
+  it('keeps operation-thrown admission errors neutral without resetting prior failures', async () => {
+    const run = protect({ circuit: { threshold: 2, cooldown: 100 } })
+    const error = new Error('unavailable')
+
+    function fail(): never {
+      throw error
+    }
+
+    await expect(run(fail)).rejects.toBe(error)
+
+    for (const admissionError of [new QueueFullError(), new CircuitOpenError()]) {
+      await expect(
+        run(() => {
+          throw admissionError
+        }),
+      ).rejects.toBe(admissionError)
+    }
+
+    await expect(run(fail)).rejects.toBe(error)
+    await expect(run(() => 'skipped')).rejects.toBeInstanceOf(CircuitOpenError)
   })
 
   it('counts only the final timeout and ignores detached callbacks', async () => {

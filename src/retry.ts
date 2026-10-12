@@ -1,23 +1,27 @@
 import { ErrorPolicyError, TimeoutError } from './errors.js'
-import type {
-  BackoffOptions,
-  ErrorDecision,
-  ErrorPolicy,
-  RunContext,
-  TimeoutMode,
-} from './types.js'
+import type { BackoffOptions, ErrorDecision, RunContext, TimeoutMode } from './types.js'
 
-interface ExecutionOptions {
+interface ExecutionDecision extends ErrorDecision {
+  failover?: boolean
+}
+
+export interface ExecutionOptions {
   attempts: number
   backoff: Required<BackoffOptions> | undefined
   timeout: number | undefined
   timeoutMode: TimeoutMode
-  errorPolicy: ErrorPolicy | undefined
+  errorPolicy: ((error: unknown) => ExecutionDecision) | undefined
 }
 
-type ExecutionResult<Result> =
+export type ExecutionResult<Result> =
   | { ok: true; value: Awaited<Result> }
-  | { ok: false; error: unknown; countForCircuit: boolean; recoverable: boolean }
+  | {
+      ok: false
+      error: unknown
+      countForCircuit: boolean
+      recoverable: boolean
+      failover: boolean
+    }
 
 function wait(duration: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -105,7 +109,7 @@ export async function execute<Result>(
     } catch (error) {
       signal.throwIfAborted()
 
-      let decision: ErrorDecision
+      let decision: ExecutionDecision
 
       try {
         decision = errorPolicy?.(error) ?? { retry: true, countForCircuit: true }
@@ -117,6 +121,7 @@ export async function execute<Result>(
           error: new ErrorPolicyError(error, policyError),
           countForCircuit: false,
           recoverable: false,
+          failover: false,
         }
       }
 
@@ -128,6 +133,7 @@ export async function execute<Result>(
           error,
           countForCircuit: decision.countForCircuit,
           recoverable: true,
+          failover: decision.failover ?? true,
         }
       }
 
